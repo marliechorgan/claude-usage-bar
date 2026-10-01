@@ -1,0 +1,7 @@
+{
+  "accounts": [
+    { "name": "Personal", "subtitle": "Max", "glyph": "☀︎", "symbol": "sun.max.fill", "tint": "orange" },
+    { "name": "Work", "subtitle": "Team", "glyph": "☾", "symbol": "moon.fill", "tint": "indigo",
+      "config_dir": "~/.claude-work", "desktop_profile": "~/Library/Application Support/Claude-work" }
+  ]
+}
