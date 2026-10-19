@@ -340,15 +340,26 @@ func ageText(_ minutes: Double) -> String {
 func menuBarTitle(_ model: Model) -> NSAttributedString {
     let d = UserDefaults.standard
     let metric = d.string(forKey: "title.metric") ?? "now"
-    let icons = (d.string(forKey: "title.style") ?? "icons") == "icons"
-    let parts = accounts.filter { d.object(forKey: "show.\($0.id)") as? Bool ?? true }.map { a -> String in
+    let style = d.string(forKey: "title.style") ?? "icons"
+    let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+    let lefts = accounts.filter { d.object(forKey: "show.\($0.id)") as? Bool ?? true }.map { a -> (Account, Double?) in
         let r = model.readings[a.id]
-        let v = metric == "week" ? r?.week?.left : metric == "five" ? r?.fiveHour?.left : r?.usableNow
-        return "\(icons ? a.glyph : a.letter) \(percent(v.map(shown)))"
+        return (a, metric == "week" ? r?.week?.left : metric == "five" ? r?.fiveHour?.left : r?.usableNow)
     }
-    return NSAttributedString(
-        string: parts.isEmpty ? "Claude" : parts.joined(separator: "   "),
-        attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .medium)])
+    guard !lefts.isEmpty else { return NSAttributedString(string: "Claude", attributes: [.font: font]) }
+    // "none": bare numbers in config order, one % at the end, so six accounts fit where two used to
+    let bare = style == "none"
+    let title = NSMutableAttributedString()
+    for (i, (a, left)) in lefts.enumerated() {
+        if i > 0 { title.append(NSAttributedString(string: bare ? " · " : "   ", attributes: [.font: font])) }
+        let number = bare ? left.map { "\(Int(shown($0).rounded()))" } ?? "–" : percent(left.map(shown))
+        let mark = bare ? "" : "\(style == "icons" ? a.glyph : a.letter) "
+        var attrs: [NSAttributedString.Key: Any] = [.font: font]
+        if let left, left <= 10 { attrs[.foregroundColor] = NSColor.systemRed }   // nearly out
+        title.append(NSAttributedString(string: mark + number, attributes: attrs))
+    }
+    if bare { title.append(NSAttributedString(string: "%", attributes: [.font: font])) }
+    return title
 }
 
 // MARK: - Panel
@@ -479,6 +490,7 @@ struct SettingsPanel: View {
                     Picker("", selection: $style) {
                         Text(accounts.map(\.glyph).joined(separator: " ")).tag("icons")
                         Text(accounts.map(\.letter).joined(separator: " ")).tag("letters")
+                        Text("None").tag("none")
                     }
                     .pickerStyle(.segmented)
                     .fixedSize()
