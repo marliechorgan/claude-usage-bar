@@ -347,7 +347,7 @@ func menuBarTitle(_ model: Model) -> NSAttributedString {
         return (a, metric == "week" ? r?.week?.left : metric == "five" ? r?.fiveHour?.left : r?.usableNow)
     }
     guard !lefts.isEmpty else { return NSAttributedString(string: "Claude", attributes: [.font: font]) }
-    // "none": bare numbers in config order, one % at the end, so six accounts fit where two used to
+    // "none": bare numbers in config order, so six accounts fit where two used to
     let bare = style == "none"
     let title = NSMutableAttributedString()
     for (i, (a, left)) in lefts.enumerated() {
@@ -358,7 +358,6 @@ func menuBarTitle(_ model: Model) -> NSAttributedString {
         if let left, left <= 10 { attrs[.foregroundColor] = NSColor.systemRed }   // nearly out
         title.append(NSAttributedString(string: mark + number, attributes: attrs))
     }
-    if bare { title.append(NSAttributedString(string: "%", attributes: [.font: font])) }
     return title
 }
 
