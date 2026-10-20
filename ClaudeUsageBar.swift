@@ -33,6 +33,7 @@ struct Account: Identifiable {
     let desktopProfile: String?  // the desktop app's --user-data-dir for this account; nil = its default profile
     var hasDesktopApp = true     // false hides the Open button (a login used only from the terminal)
     var group = ""               // the "Use X" hint only suggests an account from the same group
+    var desktopLauncher: String? = nil  // an app that starts this account's desktop app; the Open button opens it
 }
 
 let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -65,7 +66,8 @@ func loadAccounts(_ path: String) -> ([Account], String?) {
                             configDir: dir == defaultDir ? nil : dir,   // naming ~/.claude explicitly would point at a different keychain login
                             tokenFile: text("token_file").map { NSString(string: $0).expandingTildeInPath },
                             desktopProfile: text("desktop_profile").map { NSString(string: $0).expandingTildeInPath },
-                            hasDesktopApp: row["desktop_app"] as? Bool ?? true, group: text("group") ?? ""))
+                            hasDesktopApp: row["desktop_app"] as? Bool ?? true, group: text("group") ?? "",
+                            desktopLauncher: text("desktop_launcher").map { NSString(string: $0).expandingTildeInPath }))
     }
     return (list.isEmpty ? fallback : list,
             unusable.isEmpty ? nil : "Skipped in \(path): \(unusable.joined(separator: ", ")).")
@@ -227,7 +229,8 @@ func openDesktop(_ account: Account) {
     }
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-    p.arguments = account.desktopProfile.map { ["-n", "-a", "Claude", "--args", "--user-data-dir=\($0)"] } ?? ["-a", "Claude"]
+    p.arguments = account.desktopLauncher.map { ["-a", $0] }
+        ?? account.desktopProfile.map { ["-n", "-a", "Claude", "--args", "--user-data-dir=\($0)"] } ?? ["-a", "Claude"]
     try? p.run()
 }
 

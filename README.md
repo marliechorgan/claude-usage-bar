@@ -56,6 +56,7 @@ Then create `~/.config/claude-usage-bar/accounts.json` (see `accounts.example.js
 | `symbol` | An [SF Symbol](https://developer.apple.com/sf-symbols/) name for the card. |
 | `tint` | red, orange, yellow, green, mint, teal, cyan, blue, indigo, purple, pink, brown or gray. |
 | `desktop_profile` | Optional. If you run a second Claude desktop app with `--user-data-dir`, put that folder here and the Open button will open that one. |
+| `desktop_launcher` | Optional. An app that starts this account's desktop app, such as a per-account launcher in `/Applications`. If set, the Open button opens it instead of starting Claude with `desktop_profile`. |
 
 Quit and reopen the app after editing the file.
 
