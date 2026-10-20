@@ -156,7 +156,7 @@ func fetchReading(_ account: Account, claude: String) -> Result<Reading, FetchEr
     killer.cancel()
 
     var windows: [String: Any]?
-    var loggedOut = false, apiKey = false
+    var loggedOut = false, apiKey = false, billingError = false
     for line in String(decoding: out, as: UTF8.self).split(separator: "\n") {
         guard let ev = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { continue }
         switch ev["type"] as? String {
@@ -169,10 +169,13 @@ func fetchReading(_ account: Account, claude: String) -> Result<Reading, FetchEr
             if let r = ev["result"] as? String, r.localizedCaseInsensitiveContains("not logged in") { loggedOut = true }
         case "assistant":
             if (ev["error"] as? String) == "authentication_failed" { loggedOut = true }
+            if (ev["error"] as? String) == "billing_error" { billingError = true }
         default: break
         }
     }
     guard let windows else {
+        // A login whose tokens were blanked (refresh token expired) is answered with a billing error, not a 401.
+        if billingError && !apiKey { loggedOut = true }
         if loggedOut {
             return .failure(.message(account.tokenFile != nil ? "The token was rejected. Make a new one with `claude setup-token`."
                 : "Not logged in. Run `claude` and /login" + (account.configDir.map { " with CLAUDE_CONFIG_DIR=\($0)" } ?? "") + "."))
