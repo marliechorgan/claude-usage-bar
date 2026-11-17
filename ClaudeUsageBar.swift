@@ -43,6 +43,8 @@ struct Account: Identifiable {
     var desktopLauncher: String? = nil  // an app that starts this account's desktop app; the Open button opens it
     var usageFile: String? = nil        // a file another tool keeps a reading in (statusLine cache shape)
     var roleID: String? = nil           // this account's id in the roles file (see RoleSource)
+    var section: String? = nil          // the panel draws a divider where this changes; defaults to group
+    var panelSection: String { section ?? group }
 }
 
 /// Where the role labels come from: a YAML-style file with a section of `key: id id …` lines, and
@@ -150,7 +152,7 @@ func loadAccounts(_ path: String) -> ([Account], String?) {
                             hasDesktopApp: row["desktop_app"] as? Bool ?? true, group: text("group") ?? "",
                             desktopLauncher: text("desktop_launcher").map { NSString(string: $0).expandingTildeInPath },
                             usageFile: text("usage_file").map { NSString(string: $0).expandingTildeInPath },
-                            roleID: text("role_id")))
+                            roleID: text("role_id"), section: text("section")))
     }
     return (list.isEmpty ? fallback : list,
             unusable.isEmpty ? nil : "Skipped in \(path): \(unusable.joined(separator: ", ")).")
@@ -503,6 +505,47 @@ func paceText(_ limit: Limit) -> String? {
     return pts < 3 ? "on pace" : gap > 0 ? "\(pts) over pace" : "\(pts) under pace"
 }
 
+/// When this window runs out if use carries on at its average rate so far; nil when it lasts to its
+/// reset or there is too little of the window behind us (under 5%) to say. An empty window is out now.
+func runOut(_ limit: Limit, at now: Date = Date()) -> Date? {
+    if limit.left <= 0.5 { return now }
+    guard let through = limit.through(at: now), through >= 0.05, limit.used > 0, let reset = limit.resetsAt else { return nil }
+    let rate = limit.used / (through * limit.window)          // points per second so far
+    let out = now.addingTimeInterval(limit.left / rate)
+    return out < reset ? out : nil
+}
+
+/// The one line a row leads with: out (and until when), going to run out (and roughly when), or when it resets.
+func statusLine(_ r: Reading, fiveHour: Bool, resets: Bool, at now: Date = Date()) -> (text: String, color: Color?) {
+    let limits = [r.week, fiveHour ? r.fiveHour : nil].compactMap { $0 }
+    let empty = limits.filter { $0.left <= 0.5 }
+    if !empty.isEmpty {
+        let back = empty.compactMap(\.resetsAt).max()
+        return ("Out · back \(back.map { resetText($0) } ?? "soon")", .red)
+    }
+    // A 5-hour window is only worth projecting once it is half used; earlier it is noise.
+    let outs = limits.filter { $0.window == weekWindow || $0.used >= 50 }.compactMap { runOut($0, at: now) }
+    if let out = outs.min() { return ("Runs out ~\(resetText(out))", .orange) }
+    if resets, let w = r.week, let at = w.resetsAt { return ("Resets \(resetText(at))", nil) }
+    return ("", nil)
+}
+
+/// The account's own Dock icon (its desktop_launcher app, or Claude.app for the default profile).
+var iconCache: [String: NSImage] = [:]
+func appIcon(_ a: Account) -> NSImage? {
+    guard a.hasDesktopApp else { return nil }
+    let path = a.desktopLauncher ?? (a.desktopProfile == nil ? "/Applications/Claude.app" : nil)
+    guard let path, FileManager.default.fileExists(atPath: path) else { return nil }
+    if let hit = iconCache[path] { return hit }
+    // The bundle's own icon file first: the Finder icon carries a padlock badge on a locked bundle.
+    let file = (Bundle(path: path)?.object(forInfoDictionaryKey: "CFBundleIconFile") as? String).map {
+        "\(path)/Contents/Resources/\($0.hasSuffix(".icns") ? $0 : $0 + ".icns")"
+    }
+    let img = file.flatMap { NSImage(contentsOfFile: $0) } ?? NSWorkspace.shared.icon(forFile: path)
+    iconCache[path] = img
+    return img
+}
+
 func ageText(_ minutes: Double) -> String {
     minutes < 1 ? "just now"
         : minutes < 90 ? "\(Int(minutes)) min ago"
@@ -556,7 +599,7 @@ enum Metrics {
     static let panelWidth: CGFloat = 348
     static let pad: CGFloat = 12
     static let iconColumn: CGFloat = 18
-    static let labelColumn: CGFloat = 40
+    static let labelColumn: CGFloat = 30
     static let percentColumn: CGFloat = 34
     static let gap: CGFloat = 8
 }
@@ -583,38 +626,25 @@ struct PaceBar: View {
             .frame(maxHeight: .infinity)
         }
         .frame(height: 11)
+        .help("The tick is how far through this window the clock is. Fill past it: used faster than an even pace.")
     }
 }
 
 struct LimitRow: View {
     let label: String
     let limit: Limit
-    let showReset: Bool
     var body: some View {
         let color = tone(limit)
-        let through = limit.through()
-        // A 5-hour window that's under pace says nothing worth reading; over pace it does.
-        let pace = limit.window == weekWindow || (limit.paceGap() ?? 0) > paceSlack ? paceText(limit) : nil
-        let caption = [pace, showReset ? limit.resetsAt.map { "resets \(resetText($0))" } ?? "reset" : nil]
-            .compactMap { $0 }.joined(separator: " · ")
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: Metrics.gap) {
-                Text(label).frame(width: Metrics.labelColumn, alignment: .leading).foregroundStyle(.secondary)
-                PaceBar(fill: shown(limit.left), tick: through.map { showUsed() ? $0 : 1 - $0 }, color: color)
-                Text(percent(shown(limit.left)))
-                    .monospacedDigit()
-                    .foregroundStyle(color ?? .secondary)
-                    .frame(width: Metrics.percentColumn, alignment: .trailing)
-            }
-            .font(.system(size: 11))
-            if !caption.isEmpty {
-                Text(caption)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-                    .padding(.leading, Metrics.labelColumn + Metrics.gap)
-            }
+        HStack(spacing: Metrics.gap) {
+            Text(label).frame(width: Metrics.labelColumn, alignment: .leading).foregroundStyle(.tertiary)
+            PaceBar(fill: shown(limit.left), tick: limit.through().map { showUsed() ? $0 : 1 - $0 }, color: color)
+            Text(percent(shown(limit.left)))
+                .monospacedDigit()
+                .foregroundStyle(color ?? .secondary)
+                .frame(width: Metrics.percentColumn, alignment: .trailing)
         }
+        .font(.system(size: 10.5))
+        .help(paceText(limit).map { "\($0) (percentage points against an even pace)" } ?? "")
     }
 }
 
@@ -624,71 +654,70 @@ struct AccountCard: View {
     let showFiveHour: Bool
     let showResets: Bool
     let onOpen: () -> Void
+    @State private var hover = false
 
     var body: some View {
         let reading = model.readings[account.id]
         let problem = model.problems[account.id]
         let running = model.running[account.id] != nil
         let checking = model.checking.contains(account.id)
-        let subtitle = model.subtitle(account)
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(alignment: .top, spacing: Metrics.gap) {
-                Image(systemName: account.symbol)
-                    .font(.system(size: 13))
-                    .foregroundStyle(account.tint)
-                    .frame(width: Metrics.iconColumn, height: 17)
-                VStack(alignment: .leading, spacing: 1) {
-                    HStack(spacing: 5) {
-                        Text(account.name).font(.system(size: 13, weight: .semibold))
-                        if running { Circle().fill(.green).frame(width: 6, height: 6).help("Its desktop app is open") }
-                        if account.hasDesktopApp {
-                            Button(action: onOpen) { Image(systemName: "arrow.up.forward.app").font(.system(size: 11)) }
-                                .buttonStyle(.borderless)
-                                .foregroundStyle(.tertiary)
-                                .help(running ? "Switch to \(account.name)'s Claude app" : "Open \(account.name)'s Claude app")
-                        }
-                    }
-                    if !subtitle.isEmpty {
-                        Text(subtitle).font(.system(size: 10.5)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
-                    }
-                }
-                Spacer(minLength: 4)
-                VStack(alignment: .trailing, spacing: 1) {
-                    if let r = reading, let lead = headline(r) {
-                        Text(percent(shown(lead.left)))
-                            .font(.system(size: 17, weight: .semibold, design: .rounded))
-                            .monospacedDigit()
-                            .foregroundStyle(tone(lead) ?? .primary)
-                            .help("\(modeWord()) · \(lead.window == weekWindow ? "week" : "5-hour")")
-                    }
-                    Group {
-                        if checking { Text("checking…") }
-                        else if let r = reading { Text(ageText(r.ageMinutes)).help(sourceText(r)) }
-                    }
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-                    .monospacedDigit()
+        let status = reading.map { statusLine($0, fiveHour: showFiveHour, resets: showResets) }
+        let stale = reading.map { $0.ageMinutes >= 20 } ?? false
+        HStack(alignment: .top, spacing: 10) {
+            Group {
+                if let icon = appIcon(account) {
+                    Image(nsImage: icon).resizable().interpolation(.high)
+                } else {
+                    Image(systemName: account.symbol).font(.system(size: 15)).foregroundStyle(account.tint)
                 }
             }
-            if let r = reading {
-                VStack(alignment: .leading, spacing: 5) {
-                    if let w = r.week { LimitRow(label: "Week", limit: w, showReset: showResets) }
-                    if showFiveHour, let f = r.fiveHour { LimitRow(label: "5-hour", limit: f, showReset: showResets) }
+            .frame(width: 26, height: 26)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 5) {
+                    Text(account.name).font(.system(size: 12.5, weight: .semibold)).lineLimit(1)
+                    if running { Circle().fill(.green).frame(width: 5, height: 5).help("Its desktop app is open") }
+                    Spacer(minLength: 6)
+                    if checking { ProgressView().controlSize(.mini) }
+                    if let status, !status.text.isEmpty {
+                        Text(status.text)
+                            .font(.system(size: 11, weight: status.color == nil ? .regular : .medium))
+                            .foregroundStyle(status.color ?? .secondary)
+                            .monospacedDigit().lineLimit(1)
+                    }
                 }
-            } else if problem == nil {
-                Text(checking ? "Checking…" : "No reading yet").font(.system(size: 10.5)).foregroundStyle(.secondary)
-            }
-            if let problem {
-                Label(problem, systemImage: "exclamationmark.triangle")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
+                if let r = reading {
+                    if let w = r.week { LimitRow(label: "Week", limit: w) }
+                    if showFiveHour, let f = r.fiveHour { LimitRow(label: "5h", limit: f) }
+                    if stale { Text("Reading \(ageText(r.ageMinutes))").font(.system(size: 10)).foregroundStyle(.tertiary) }
+                } else if problem == nil {
+                    Text(checking ? "Checking…" : "No reading yet").font(.system(size: 10.5)).foregroundStyle(.secondary)
+                }
+                if let problem {
+                    Label(problem, systemImage: "exclamationmark.triangle")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 9)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 7)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color.primary.opacity(0.05)))
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .fill(Color.primary.opacity(hover && account.hasDesktopApp ? 0.07 : 0)))
+        .contentShape(Rectangle())
+        .onHover { hover = $0 }
+        .onTapGesture { if account.hasDesktopApp { onOpen() } }
+        .help(helpText(reading, running: running))
+    }
+
+    func helpText(_ r: Reading?, running: Bool) -> String {
+        var parts: [String] = []
+        let sub = model.subtitle(account)
+        if !sub.isEmpty { parts.append(sub) }
+        if account.hasDesktopApp { parts.append(running ? "Click to switch to its Claude app" : "Click to open its Claude app") }
+        if let r { parts.append("\(sourceText(r)), \(ageText(r.ageMinutes))") }
+        return parts.joined(separator: "\n")
     }
 
     func sourceText(_ r: Reading) -> String {
@@ -840,18 +869,20 @@ struct PanelView: View {
                 }
                 ForEach(model.hints, id: \.self) { hint in
                     Label(hint, systemImage: "arrow.right.circle.fill")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .padding(.horizontal, 9).padding(.vertical, 6)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.accentColor.opacity(0.12)))
                 }
-                VStack(spacing: 6) {
-                    ForEach(accounts) { a in
+                VStack(spacing: 0) {
+                    ForEach(Array(accounts.enumerated()), id: \.element.id) { i, a in
+                        if i > 0, accounts[i - 1].panelSection != a.panelSection {
+                            Divider().padding(.vertical, 4).padding(.horizontal, 8)
+                        }
                         AccountCard(account: a, model: model, showFiveHour: showFiveHour, showResets: showResets) { onOpen(a) }
                     }
                 }
-                Text("The tick on each bar is how far through that window the clock is. Past it: used faster than an even pace.")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(Metrics.pad)
@@ -1032,6 +1063,21 @@ func selftest() -> Int32 {
     expect("pace: a passed reset is full with no tick", passed.week?.left == 100 && passed.week?.through() == nil)
     expect("pace text: under", paceText(Limit(left: 90, resetsAt: now.addingTimeInterval(weekWindow / 2))) == "40 under pace")
     expect("pace text: on", paceText(Limit(left: 49, resetsAt: now.addingTimeInterval(weekWindow / 2))) == "on pace")
+
+    let fast = Limit(left: 40, resetsAt: now.addingTimeInterval(weekWindow / 2))   // 60 used at half way
+    let fastOut = runOut(fast, at: now)
+    expect("run-out: 60 used at half way runs out a third of a week from now",
+           fastOut.map { abs($0.timeIntervalSince(now) - weekWindow / 3) < 60 } ?? false)
+    expect("run-out: 20 used at half way lasts to the reset", runOut(Limit(left: 80, resetsAt: now.addingTimeInterval(weekWindow / 2)), at: now) == nil)
+    expect("run-out: too early in the window to say", runOut(Limit(left: 90, resetsAt: now.addingTimeInterval(weekWindow * 0.98)), at: now) == nil)
+    let outRead = Reading(weekUsed: 30, weekResets: now.addingTimeInterval(weekWindow / 2), fiveUsed: 100,
+                          fiveResets: now.addingTimeInterval(3600), takenAt: now)
+    expect("status: an empty 5-hour window is out until it resets",
+           statusLine(outRead, fiveHour: true, resets: true, at: now).text == "Out · back \(resetText(now.addingTimeInterval(3600)))")
+    let calm = Reading(weekUsed: 20, weekResets: now.addingTimeInterval(weekWindow / 2), fiveUsed: nil, fiveResets: nil, takenAt: now)
+    expect("status: a calm account shows its reset", statusLine(calm, fiveHour: true, resets: true, at: now).text.hasPrefix("Resets "))
+    let hot = Reading(weekUsed: 60, weekResets: now.addingTimeInterval(weekWindow / 2), fiveUsed: nil, fiveResets: nil, takenAt: now)
+    expect("status: a fast account warns", statusLine(hot, fiveHour: true, resets: true, at: now).text.hasPrefix("Runs out ~"))
 
     let f = DateFormatter(); f.dateFormat = "EEE HH:mm"
     let soon = now.addingTimeInterval(3600), later = now.addingTimeInterval(5 * 86400)

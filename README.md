@@ -50,13 +50,14 @@ Then create `~/.config/claude-usage-bar/accounts.json` (see `accounts.example.js
 | `config_dir` | The account's `CLAUDE_CONFIG_DIR`. Leave out both this and `token_file` for your default `~/.claude` login. |
 | `token_file` | Instead of a config folder: a file holding a token from `claude setup-token`. |
 | `group` | The "Use X" hint only suggests an account in the same group, so it won't send personal work to a work seat. |
-| `desktop_app` | `false` hides the Open button, for a login you only use in the terminal. |
+| `section` | Optional. The panel draws a divider between accounts whose section differs. Defaults to `group`. |
+| `desktop_app` | `false` makes the row not open anything, for a login you only use in the terminal. |
 | `subtitle` | Small text beside the name, e.g. the plan and what the account is for. |
 | `glyph` | The mark in the menu bar (any character). |
 | `symbol` | An [SF Symbol](https://developer.apple.com/sf-symbols/) name for the card. |
 | `tint` | red, orange, yellow, green, mint, teal, cyan, blue, indigo, purple, pink, brown or gray. |
-| `desktop_profile` | Optional. If you run a second Claude desktop app with `--user-data-dir`, put that folder here and the Open button will open that one. |
-| `desktop_launcher` | Optional. An app that starts this account's desktop app, such as a per-account launcher in `/Applications`. If set, the Open button opens it instead of starting Claude with `desktop_profile`. |
+| `desktop_profile` | Optional. If you run a second Claude desktop app with `--user-data-dir`, put that folder here and clicking its row opens that one. |
+| `desktop_launcher` | Optional. An app that starts this account's desktop app, such as a per-account launcher in `/Applications`. If set, clicking the row opens it instead of starting Claude with `desktop_profile`, and the row shows its icon. |
 | `usage_file` | Optional. A file another tool keeps this account's reading in, in Claude Code's statusLine-cache shape: `seven_day_pct`, `seven_day_resets_at`, `five_hour_pct`, `five_hour_resets_at` (ISO time or epoch seconds) and `at_epoch` (when it was read). The app shows whichever is newer, the file or its own check, so a fresh file saves a check. A file without `at_epoch` is ignored. |
 | `role_id` | Optional. This account's id in the roles file (below). |
 
@@ -76,7 +77,7 @@ Quit and reopen the app after editing the file.
 
 ## Reading the panel
 
-Each card leads with the same number the menu bar shows for it, with the age of that account's reading underneath. Each limit has a bar of how much is used and a tick at how far through that window the clock is: fill past the tick means the account is being used faster than an even pace, and the line under it says by how many points. Colour only means something: orange when more than 5 points over pace, red when 10% or less is left. Reset times are always shown as weekday and time.
+Each account is one row: its desktop app's own icon, a green dot when that app is open, and one status line. The status says the account is **out** and when it comes back, that it **runs out** around a given time if use carries on at its rate so far this window, or otherwise when the week resets. Under it, each limit has a bar of how much is used and a tick at how far through that window the clock is: fill past the tick means the account is being used faster than an even pace (hover for by how many points). Colour only means something: orange when more than 5 points over pace or set to run out early, red when out or 10% or less is left. Click a row to open or switch to that account's desktop app; hover it for where the reading came from and how old it is. A reading over 20 minutes old says so under its bars.
 
 The "Use X" line appears when an account is nearly out (under 10% left) and another account in the same `group` isn't. Give an account its own `group` to keep it out of those suggestions.
 
