@@ -5,12 +5,19 @@
 // (`claude -p hi --model haiku --output-format stream-json --verbose`) and reads the
 // `rate_limit_event` Claude Code prints, the same figures its own /usage and statusLine show.
 // It uses Claude Code's existing login for that account. It never reads, copies or refreshes
-// tokens, cookies or the keychain itself.
+// tokens, cookies or the keychain itself. If another tool already keeps a reading for an account
+// in a file (`usage_file`), the app reads that file too and shows whichever reading is newer, so
+// it runs fewer turns of its own.
+//
+// Freshness: while the panel is open no reading is more than about 2 minutes old; while it is
+// closed each account is checked when its newest reading passes 15 minutes. Each card says how old
+// its own reading is.
 //
 // Accounts: ~/.config/claude-usage-bar/accounts.json (see accounts.example.json). With no file,
 // it shows one account: your normal `claude` login.
 //
 // Build + install: ./build.sh   ·   Render the panel to PNGs: ClaudeUsageBar --snapshot <dir>
+// Check the parsing and pace maths: ClaudeUsageBar --selftest
 
 import AppKit
 import Combine
@@ -34,14 +41,88 @@ struct Account: Identifiable {
     var hasDesktopApp = true     // false hides the Open button (a login used only from the terminal)
     var group = ""               // the "Use X" hint only suggests an account from the same group
     var desktopLauncher: String? = nil  // an app that starts this account's desktop app; the Open button opens it
+    var usageFile: String? = nil        // a file another tool keeps a reading in (statusLine cache shape)
+    var roleID: String? = nil           // this account's id in the roles file (see RoleSource)
+}
+
+/// Where the role labels come from: a YAML-style file with a section of `key: id id …` lines, and
+/// the label to show for each key. A label list gives one label per position in that key's list.
+struct RoleSource {
+    let file: String
+    let section: String
+    let labels: [String: [String]]
 }
 
 let home = FileManager.default.homeDirectoryForCurrentUser.path
-let claudeAppBin = "/Applications/Claude.app/Contents/MacOS/Claude"
 let configPath = ProcessInfo.processInfo.environment["CLAUDE_USAGE_BAR_CONFIG"] ?? "\(home)/.config/claude-usage-bar/accounts.json"
 let (accounts, configProblem) = loadAccounts(configPath)
+let roleSource = loadRoleSource(configPath)
 let lowPercent = 25.0
-let autoRefreshMinutes = 30.0
+/// Oldest a reading may get before the app checks that account again: open panel, closed panel.
+/// 2 minutes is what "live" needs while you look; 15 minutes keeps the menu-bar numbers within a
+/// point or two on a weekly window while costing at most four tiny Haiku turns an hour per account.
+let maxAgeOpen: TimeInterval = 120
+let maxAgeClosed: TimeInterval = 15 * 60
+let failedRetry: TimeInterval = 10 * 60   // after a failed check, wait this long before trying that account again
+let weekWindow: TimeInterval = 7 * 24 * 3600
+let fiveHourWindow: TimeInterval = 5 * 3600
+
+func loadRoleSource(_ path: String) -> RoleSource? {
+    guard let data = FileManager.default.contents(atPath: path),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let roles = json["roles"] as? [String: Any], let file = roles["file"] as? String,
+          let raw = roles["labels"] as? [String: Any] else { return nil }
+    var labels: [String: [String]] = [:]
+    for (k, v) in raw {
+        if let s = v as? String { labels[k] = [s] } else if let l = v as? [String] { labels[k] = l }
+    }
+    return RoleSource(file: NSString(string: file).expandingTildeInPath,
+                      section: roles["section"] as? String ?? "accounts", labels: labels)
+}
+
+/// Reads `key: a b c  # comment` lines from one top-level section of a YAML-style file. Only the
+/// section's direct children count; values are split on spaces. Returns them in file order.
+func parseRoleSection(_ text: String, section: String) -> [(key: String, ids: [String])] {
+    var out: [(String, [String])] = []
+    var inside = false
+    var childIndent: Int?
+    for line in text.components(separatedBy: "\n") {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+        let indent = line.prefix { $0 == " " }.count
+        if indent == 0 {
+            if inside { break }
+            inside = trimmed == "\(section):" || trimmed.hasPrefix("\(section): #") || trimmed.hasPrefix("\(section):#")
+            continue
+        }
+        guard inside else { continue }
+        if childIndent == nil { childIndent = indent }
+        guard indent == childIndent, let colon = trimmed.firstIndex(of: ":") else { continue }
+        let key = String(trimmed[..<colon])
+        var value = String(trimmed[trimmed.index(after: colon)...])
+        if let hash = value.range(of: " #") ?? (value.hasPrefix("#") ? value.range(of: "#") : nil) {
+            value = String(value[..<hash.lowerBound])
+        }
+        let ids = value.split(separator: " ").map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"'")) }
+            .filter { !$0.isEmpty }
+        out.append((key, ids))
+    }
+    return out
+}
+
+/// The role labels for each account id, in the order the keys appear in the roles file.
+func roleLabels(_ source: RoleSource, text: String, for list: [Account] = accounts) -> [String: [String]] {
+    var result: [String: [String]] = [:]
+    for (key, ids) in parseRoleSection(text, section: source.section) {
+        guard let labels = source.labels[key], !labels.isEmpty else { continue }
+        for a in list {
+            guard let rid = a.roleID, let pos = ids.firstIndex(of: rid) else { continue }
+            let label = labels[min(pos, labels.count - 1)]
+            if !label.isEmpty { result[a.id, default: []].append(label) }
+        }
+    }
+    return result
+}
 
 func loadAccounts(_ path: String) -> ([Account], String?) {
     let fallback = [Account(id: "default", name: "Claude", subtitle: "claude login", glyph: "✳︎", symbol: "sparkle",
@@ -67,7 +148,9 @@ func loadAccounts(_ path: String) -> ([Account], String?) {
                             tokenFile: text("token_file").map { NSString(string: $0).expandingTildeInPath },
                             desktopProfile: text("desktop_profile").map { NSString(string: $0).expandingTildeInPath },
                             hasDesktopApp: row["desktop_app"] as? Bool ?? true, group: text("group") ?? "",
-                            desktopLauncher: text("desktop_launcher").map { NSString(string: $0).expandingTildeInPath }))
+                            desktopLauncher: text("desktop_launcher").map { NSString(string: $0).expandingTildeInPath },
+                            usageFile: text("usage_file").map { NSString(string: $0).expandingTildeInPath },
+                            roleID: text("role_id")))
     }
     return (list.isEmpty ? fallback : list,
             unusable.isEmpty ? nil : "Skipped in \(path): \(unusable.joined(separator: ", ")).")
@@ -78,6 +161,20 @@ func loadAccounts(_ path: String) -> ([Account], String?) {
 struct Limit {
     let left: Double      // % left, 0–100
     let resetsAt: Date?   // nil when the window has already rolled over since the reading
+    var window: TimeInterval = weekWindow
+
+    var used: Double { 100 - left }
+    /// How far through its window the clock is, 0–1; nil when the reset time isn't known.
+    func through(at now: Date = Date()) -> Double? {
+        resetsAt.map { min(1, max(0, 1 - $0.timeIntervalSince(now) / window)) }
+    }
+    /// Percentage points used beyond (positive) or short of (negative) an even pace through the window.
+    func paceGap(at now: Date = Date()) -> Double? { through(at: now).map { used - $0 * 100 } }
+}
+
+enum ReadingSource: Equatable {
+    case check            // this app's own Claude Code turn
+    case file(String)     // a usage_file another tool keeps
 }
 
 struct Reading {
@@ -86,18 +183,41 @@ struct Reading {
     let fiveUsed: Double?
     let fiveResets: Date?
     let takenAt: Date
+    var source: ReadingSource = .check
 
     /// A window whose reset time has passed is full again; Claude Code treats it the same way.
-    private func limit(_ used: Double?, _ resets: Date?) -> Limit? {
-        if let resets, resets <= Date() { return Limit(left: 100, resetsAt: nil) }
-        return used.map { Limit(left: max(0, 100 - $0), resetsAt: resets) }
+    private func limit(_ used: Double?, _ resets: Date?, _ window: TimeInterval) -> Limit? {
+        if let resets, resets <= Date() { return Limit(left: 100, resetsAt: nil, window: window) }
+        return used.map { Limit(left: max(0, 100 - $0), resetsAt: resets, window: window) }
     }
-    var week: Limit? { limit(weekUsed, weekResets) }
-    var fiveHour: Limit? { limit(fiveUsed, fiveResets) }
+    var week: Limit? { limit(weekUsed, weekResets, weekWindow) }
+    var fiveHour: Limit? { limit(fiveUsed, fiveResets, fiveHourWindow) }
     var usableNow: Double? { [week, fiveHour].compactMap { $0?.left }.min() }
     var binding: Limit? { [week, fiveHour].compactMap { $0 }.min { $0.left < $1.left } }
     var bindingName: String { (fiveHour?.left ?? 101) < (week?.left ?? 101) ? "5-hour" : "week" }
     var ageMinutes: Double { Date().timeIntervalSince(takenAt) / 60 }
+}
+
+/// Reads a usage file in Claude Code's statusLine-cache shape:
+/// {"seven_day_pct": 52.0, "seven_day_resets_at": "2030-01-05T15:00:00+00:00" (or epoch seconds),
+///  "five_hour_pct": 3, "five_hour_resets_at": …, "at_epoch": 1893800000}
+/// A file without `at_epoch` or without a weekly figure is ignored: its age can't be known.
+func readUsageFile(_ path: String) -> Reading? {
+    guard let data = FileManager.default.contents(atPath: path),
+          let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let at = (d["at_epoch"] as? NSNumber)?.doubleValue, at > 0,
+          let week = (d["seven_day_pct"] as? NSNumber)?.doubleValue else { return nil }
+    func date(_ key: String) -> Date? {
+        if let n = d[key] as? NSNumber { return Date(timeIntervalSince1970: n.doubleValue) }
+        guard let s = d[key] as? String else { return nil }
+        let f = ISO8601DateFormatter()
+        if let x = f.date(from: s) { return x }
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f.date(from: s)
+    }
+    return Reading(weekUsed: week, weekResets: date("seven_day_resets_at"),
+                   fiveUsed: (d["five_hour_pct"] as? NSNumber)?.doubleValue, fiveResets: date("five_hour_resets_at"),
+                   takenAt: Date(timeIntervalSince1970: at), source: .file(path))
 }
 
 /// Finds the Claude Code CLI. Apps started from Finder get a bare PATH, so look in the usual places,
@@ -213,10 +333,14 @@ func claudeProcesses() -> [String: pid_t] {
         let line = raw.drop { $0 == " " }
         guard let space = line.firstIndex(of: " "), let pid = pid_t(line[..<space]) else { continue }
         let cmd = line[line.index(after: space)...]
-        guard cmd == claudeAppBin || cmd.hasPrefix(claudeAppBin + " ") else { continue }
+        // The main process of any copy of the desktop app: Claude.app itself, or a per-account app
+        // (desktop_launcher) that runs its own Contents/MacOS/Claude. Helpers live elsewhere in the bundle.
+        guard let binEnd = cmd.range(of: ".app/Contents/MacOS/Claude"),
+              binEnd.upperBound == cmd.endIndex || cmd[binEnd.upperBound] == " " else { continue }
+        let args = cmd[binEnd.upperBound...]
         for a in accounts where a.hasDesktopApp {
-            let matches = a.desktopProfile.map { cmd == "\(claudeAppBin) --user-data-dir=\($0)" || cmd.hasPrefix("\(claudeAppBin) --user-data-dir=\($0) ") }
-                ?? !cmd.contains("--user-data-dir=")
+            let matches = a.desktopProfile.map { args == " --user-data-dir=\($0)" || args.hasPrefix(" --user-data-dir=\($0) ") }
+                ?? !args.contains("--user-data-dir=")
             if matches { found[a.id] = pid }
         }
     }
@@ -243,51 +367,86 @@ final class Model: ObservableObject {
     @Published var readings: [String: Reading] = [:]
     @Published var problems: [String: String] = [:]
     @Published var running: [String: pid_t] = [:]
-    @Published var refreshing = false
-    @Published var lastAttempt: Date?
+    @Published var checking: Set<String> = []
+    @Published var roles: [String: [String]] = [:]
+    private var lastAttempt: [String: Date] = [:]
+
+    var refreshing: Bool { !checking.isEmpty }
 
     func reloadRunning() { running = claudeProcesses() }
 
-    /// Fetches every account at once (one tiny Haiku turn each). A failed fetch keeps the last good
-    /// reading on screen, with its age, and shows why the new one failed.
-    func refreshNow(then done: (() -> Void)? = nil) {
-        guard !refreshing else { return }
-        refreshing = true
-        lastAttempt = Date()
-        DispatchQueue.global().async {
-            let claude = findClaude()
-            var results: [String: Result<Reading, FetchError>] = [:]
-            let lock = NSLock(), group = DispatchGroup()
-            for a in accounts {
-                group.enter()
-                DispatchQueue.global().async {
-                    let r: Result<Reading, FetchError> = claude.map { fetchReading(a, claude: $0) }
-                        ?? .failure(.message("Claude Code isn't installed. Get it at claude.com/claude-code."))
-                    lock.lock(); results[a.id] = r; lock.unlock()
-                    group.leave()
-                }
-            }
-            group.wait()
-            DispatchQueue.main.async {
-                for (id, r) in results {
-                    switch r {
-                    case .success(let reading): self.readings[id] = reading; self.problems[id] = nil
-                    case .failure(.message(let m)): self.problems[id] = m
-                    }
-                }
-                self.refreshing = false
-                self.reloadRunning()
-                done?()
-            }
+    /// Re-reads the roles file, so a change there shows on the next open without a restart.
+    func reloadRoles() {
+        guard let src = roleSource, let text = try? String(contentsOfFile: src.file, encoding: .utf8) else { roles = [:]; return }
+        roles = roleLabels(src, text: text)
+    }
+
+    func subtitle(_ a: Account) -> String {
+        let s = ([a.subtitle] + (roles[a.id] ?? [])).filter { !$0.isEmpty }.joined(separator: " · ")
+        return s.prefix(1).uppercased() + s.dropFirst()
+    }
+
+    /// Takes any usage_file reading that is newer than what's on screen. Reading a file costs nothing.
+    func loadFiles() {
+        for a in accounts {
+            guard let f = a.usageFile, let r = readUsageFile(f), r.takenAt <= Date().addingTimeInterval(60) else { continue }
+            if r.takenAt > (readings[a.id]?.takenAt ?? .distantPast) { readings[a.id] = r }
         }
     }
 
-    var hint: String? {
+    /// Checks every account whose newest reading is older than maxAge. An account is never checked
+    /// twice at once, again within a minute, or within failedRetry of a failed check.
+    func refreshStale(maxAge: TimeInterval) {
+        loadFiles()
+        let now = Date()
+        check(accounts.filter { a in
+            let age = readings[a.id].map { now.timeIntervalSince($0.takenAt) } ?? .infinity
+            let since = lastAttempt[a.id].map { now.timeIntervalSince($0) } ?? .infinity
+            return age > maxAge && since > (problems[a.id] != nil ? failedRetry : 60)
+        })
+    }
+
+    /// Checks the given accounts (one tiny Haiku turn each), each card updating as its turn ends.
+    /// A failed check keeps the last good reading on screen, with its age, and shows why it failed.
+    func check(_ list: [Account], then done: (() -> Void)? = nil) {
+        let list = list.filter { !checking.contains($0.id) }
+        guard !list.isEmpty else { done?(); return }
+        let group = DispatchGroup()
+        for a in list {
+            checking.insert(a.id)
+            lastAttempt[a.id] = Date()
+            group.enter()
+            DispatchQueue.global().async {
+                let r: Result<Reading, FetchError> = findClaude().map { fetchReading(a, claude: $0) }
+                    ?? .failure(.message("Claude Code isn't installed. Get it at claude.com/claude-code."))
+                DispatchQueue.main.async {
+                    switch r {
+                    case .success(let reading): self.readings[a.id] = reading; self.problems[a.id] = nil
+                    case .failure(.message(let m)): self.problems[a.id] = m
+                    }
+                    self.checking.remove(a.id)
+                    group.leave()
+                }
+            }
+        }
+        group.notify(queue: .main) {
+            self.reloadRunning()
+            done?()
+        }
+    }
+
+    /// One line per group in which an account is nearly out and another in the same group isn't.
+    var hints: [String] {
         let usable = accounts.compactMap { a in readings[a.id].flatMap { r in r.usableNow.map { (a, $0, r) } } }
-        guard let worst = usable.min(by: { $0.1 < $1.1 }),
-              let best = usable.filter({ $0.0.group == worst.0.group }).max(by: { $0.1 < $1.1 }),
-              worst.1 < 10, best.1 >= 10, worst.0.id != best.0.id else { return nil }
-        return "Use \(best.0.name) · \(worst.0.name) is back \(resetText(worst.2.binding?.resetsAt))"
+        var lines: [String] = [], groups: [String] = []
+        for a in accounts where !groups.contains(a.group) { groups.append(a.group) }
+        for group in groups {
+            let inGroup = usable.filter { $0.0.group == group }
+            guard let worst = inGroup.min(by: { $0.1 < $1.1 }), worst.1 < 10,
+                  let best = inGroup.filter({ $0.0.id != worst.0.id }).max(by: { $0.1 < $1.1 }), best.1 >= 10 else { continue }
+            lines.append("Use \(best.0.name) · \(worst.0.name) resets \(resetText(worst.2.binding?.resetsAt))")
+        }
+        return lines
     }
 }
 
@@ -319,45 +478,68 @@ func scheduleResetNotifications(_ model: Model) {
 
 // MARK: - Formatting
 
-func tone(left: Double) -> Color { left <= 10 ? .red : left <= 25 ? .orange : .blue }
+/// Colour only where it means something: red when nearly out, orange when used faster than an even
+/// pace through the window (more than 5 points ahead), otherwise none.
+let paceSlack = 5.0
+func tone(_ limit: Limit) -> Color? {
+    limit.left <= 10 ? .red : (limit.paceGap() ?? 0) > paceSlack ? .orange : nil
+}
 func showUsed() -> Bool { (UserDefaults.standard.string(forKey: "display.mode") ?? "used") == "used" }
 func shown(_ left: Double) -> Double { showUsed() ? 100 - left : left }
 func modeWord() -> String { showUsed() ? "used" : "left" }
 func percent(_ v: Double?) -> String { v.map { "\(Int($0.rounded()))%" } ?? "–" }
 
+/// Every reset time in one form: weekday and 24-hour time, e.g. "Sat 15:00".
 func resetText(_ date: Date?) -> String {
     guard let date else { return "now" }
-    let secs = Int(date.timeIntervalSinceNow)
-    if secs < 24 * 3600 {
-        let h = secs / 3600, m = (secs % 3600) / 60
-        return h > 0 ? "in \(h)h \(m)m" : "in \(m)m"
-    }
     let f = DateFormatter()
     f.dateFormat = "EEE HH:mm"
     return f.string(from: date)
 }
 
+func paceText(_ limit: Limit) -> String? {
+    guard let gap = limit.paceGap() else { return nil }
+    let pts = Int(abs(gap).rounded())
+    return pts < 3 ? "on pace" : gap > 0 ? "\(pts) over pace" : "\(pts) under pace"
+}
+
 func ageText(_ minutes: Double) -> String {
-    minutes < 1 ? "updated just now"
-        : minutes < 90 ? "updated \(Int(minutes)) min ago"
-        : "updated \(Int((minutes / 60).rounded())) h ago"
+    minutes < 1 ? "just now"
+        : minutes < 90 ? "\(Int(minutes)) min ago"
+        : minutes < 48 * 60 ? "\(Int((minutes / 60).rounded())) h ago"
+        : "\(Int((minutes / 1440).rounded())) days ago"
+}
+
+/// Which accounts appear in the menu bar. Keyed by name, so adding or reordering accounts doesn't
+/// move a setting to another account; the old position-keyed setting is still honoured.
+func showKey(_ a: Account) -> String { "show.\(a.name)" }
+func isShown(_ a: Account) -> Bool {
+    let d = UserDefaults.standard
+    return d.object(forKey: showKey(a)) as? Bool ?? d.object(forKey: "show.\(a.id)") as? Bool ?? true
+}
+
+/// The figure a card and the menu bar both lead with, as % left.
+func headline(_ r: Reading?) -> Limit? {
+    let metric = UserDefaults.standard.string(forKey: "title.metric") ?? "now"
+    return metric == "week" ? r?.week : metric == "five" ? r?.fiveHour : r?.binding
 }
 
 func menuBarTitle(_ model: Model) -> NSAttributedString {
-    let d = UserDefaults.standard
-    let metric = d.string(forKey: "title.metric") ?? "now"
-    let style = d.string(forKey: "title.style") ?? "icons"
+    let style = UserDefaults.standard.string(forKey: "title.style") ?? "icons"
     let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .medium)
-    let lefts = accounts.filter { d.object(forKey: "show.\($0.id)") as? Bool ?? true }.map { a -> (Account, Double?) in
-        let r = model.readings[a.id]
-        return (a, metric == "week" ? r?.week?.left : metric == "five" ? r?.fiveHour?.left : r?.usableNow)
-    }
+    let quiet: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.secondaryLabelColor]
+    let lefts = accounts.filter(isShown).map { a in (a, headline(model.readings[a.id])?.left) }
     guard !lefts.isEmpty else { return NSAttributedString(string: "Claude", attributes: [.font: font]) }
-    // "none": bare numbers in config order, so six accounts fit where two used to
+    // "none": bare numbers in config order, a thin dot inside a group and a bar between groups,
+    // so six accounts stay readable and you can tell whose number is whose by where it sits.
     let bare = style == "none"
     let title = NSMutableAttributedString()
     for (i, (a, left)) in lefts.enumerated() {
-        if i > 0 { title.append(NSAttributedString(string: bare ? " · " : "   ", attributes: [.font: font])) }
+        if i > 0 {
+            let newGroup = lefts[i - 1].0.group != a.group
+            title.append(NSAttributedString(string: bare ? (newGroup ? "\u{2002}|\u{2002}" : "\u{2009}·\u{2009}") : "   ",
+                                            attributes: bare ? quiet : [.font: font]))
+        }
         let number = bare ? left.map { "\(Int(shown($0).rounded()))" } ?? "–" : percent(left.map(shown))
         let mark = bare ? "" : "\(style == "icons" ? a.glyph : a.letter) "
         var attrs: [NSAttributedString.Key: Any] = [.font: font]
@@ -369,29 +551,69 @@ func menuBarTitle(_ model: Model) -> NSAttributedString {
 
 // MARK: - Panel
 
+/// Layout constants, so every card lines up on the same columns.
+enum Metrics {
+    static let panelWidth: CGFloat = 348
+    static let pad: CGFloat = 12
+    static let iconColumn: CGFloat = 18
+    static let labelColumn: CGFloat = 40
+    static let percentColumn: CGFloat = 34
+    static let gap: CGFloat = 8
+}
+
+/// A used-so-far bar with a tick at how far through the window the clock is: fill past the tick
+/// means the account is being used faster than an even pace.
+struct PaceBar: View {
+    let fill: Double        // 0–100, what the number beside it shows
+    let tick: Double?       // 0–1
+    let color: Color?
+    var body: some View {
+        GeometryReader { g in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.primary.opacity(0.1)).frame(height: 5)
+                Capsule().fill(color ?? Color.primary.opacity(0.42))
+                    .frame(width: fill > 0 ? max(5, g.size.width * min(fill, 100) / 100) : 0, height: 5)
+                if let tick {
+                    RoundedRectangle(cornerRadius: 0.75)
+                        .fill(Color.primary.opacity(0.85))
+                        .frame(width: 1.5, height: 11)
+                        .offset(x: min(g.size.width - 1.5, max(0, g.size.width * tick - 0.75)))
+                }
+            }
+            .frame(maxHeight: .infinity)
+        }
+        .frame(height: 11)
+    }
+}
+
 struct LimitRow: View {
     let label: String
     let limit: Limit
     let showReset: Bool
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 4) {
-                Text(label)
-                Spacer(minLength: 2)
-                Text(percent(shown(limit.left)) + (showReset ? " · \(resetText(limit.resetsAt))" : ""))
+        let color = tone(limit)
+        let through = limit.through()
+        // A 5-hour window that's under pace says nothing worth reading; over pace it does.
+        let pace = limit.window == weekWindow || (limit.paceGap() ?? 0) > paceSlack ? paceText(limit) : nil
+        let caption = [pace, showReset ? limit.resetsAt.map { "resets \(resetText($0))" } ?? "reset" : nil]
+            .compactMap { $0 }.joined(separator: " · ")
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: Metrics.gap) {
+                Text(label).frame(width: Metrics.labelColumn, alignment: .leading).foregroundStyle(.secondary)
+                PaceBar(fill: shown(limit.left), tick: through.map { showUsed() ? $0 : 1 - $0 }, color: color)
+                Text(percent(shown(limit.left)))
                     .monospacedDigit()
-                    .lineLimit(1)
+                    .foregroundStyle(color ?? .secondary)
+                    .frame(width: Metrics.percentColumn, alignment: .trailing)
             }
-            .font(.system(size: 10))
-            .foregroundStyle(.secondary)
-            GeometryReader { g in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.primary.opacity(0.1))
-                    Capsule().fill(tone(left: limit.left))
-                        .frame(width: shown(limit.left) > 0 ? max(4, g.size.width * shown(limit.left) / 100) : 0)
-                }
+            .font(.system(size: 11))
+            if !caption.isEmpty {
+                Text(caption)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .padding(.leading, Metrics.labelColumn + Metrics.gap)
             }
-            .frame(height: 4)
         }
     }
 }
@@ -407,54 +629,79 @@ struct AccountCard: View {
         let reading = model.readings[account.id]
         let problem = model.problems[account.id]
         let running = model.running[account.id] != nil
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline, spacing: 7) {
+        let checking = model.checking.contains(account.id)
+        let subtitle = model.subtitle(account)
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .top, spacing: Metrics.gap) {
                 Image(systemName: account.symbol)
-                    .font(.system(size: 12))
+                    .font(.system(size: 13))
                     .foregroundStyle(account.tint)
-                    .frame(width: 16)
-                Text(account.name).font(.system(size: 12, weight: .semibold))
-                if running { Circle().fill(.green).frame(width: 5, height: 5).help("Desktop app is open") }
-                if !account.subtitle.isEmpty {
-                    Text(account.subtitle).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+                    .frame(width: Metrics.iconColumn, height: 17)
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: 5) {
+                        Text(account.name).font(.system(size: 13, weight: .semibold))
+                        if running { Circle().fill(.green).frame(width: 6, height: 6).help("Its desktop app is open") }
+                        if account.hasDesktopApp {
+                            Button(action: onOpen) { Image(systemName: "arrow.up.forward.app").font(.system(size: 11)) }
+                                .buttonStyle(.borderless)
+                                .foregroundStyle(.tertiary)
+                                .help(running ? "Switch to \(account.name)'s Claude app" : "Open \(account.name)'s Claude app")
+                        }
+                    }
+                    if !subtitle.isEmpty {
+                        Text(subtitle).font(.system(size: 10.5)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+                    }
                 }
                 Spacer(minLength: 4)
-                if account.hasDesktopApp { Button(action: onOpen) { Image(systemName: "arrow.up.forward.app").font(.system(size: 11)) }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
-                    .help(running ? "Switch to \(account.name)'s Claude app" : "Open \(account.name)'s Claude app") }
-                if let r = reading, let now = r.usableNow {
-                    Text(percent(shown(now)))
-                        .font(.system(size: 15, weight: .semibold, design: .rounded))
-                        .monospacedDigit()
-                        .foregroundStyle(now <= 25 ? tone(left: now) : Color.primary)
-                        .help("\(modeWord()) · \(r.bindingName)")
+                VStack(alignment: .trailing, spacing: 1) {
+                    if let r = reading, let lead = headline(r) {
+                        Text(percent(shown(lead.left)))
+                            .font(.system(size: 17, weight: .semibold, design: .rounded))
+                            .monospacedDigit()
+                            .foregroundStyle(tone(lead) ?? .primary)
+                            .help("\(modeWord()) · \(lead.window == weekWindow ? "week" : "5-hour")")
+                    }
+                    Group {
+                        if checking { Text("checking…") }
+                        else if let r = reading { Text(ageText(r.ageMinutes)).help(sourceText(r)) }
+                    }
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .monospacedDigit()
                 }
             }
             if let r = reading {
-                HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 5) {
                     if let w = r.week { LimitRow(label: "Week", limit: w, showReset: showResets) }
                     if showFiveHour, let f = r.fiveHour { LimitRow(label: "5-hour", limit: f, showReset: showResets) }
                 }
             } else if problem == nil {
-                Text(model.refreshing ? "Checking…" : "No reading yet").font(.system(size: 10)).foregroundStyle(.secondary)
+                Text(checking ? "Checking…" : "No reading yet").font(.system(size: 10.5)).foregroundStyle(.secondary)
             }
             if let problem {
                 Label(problem, systemImage: "exclamationmark.triangle")
-                    .font(.system(size: 10))
+                    .font(.system(size: 10.5))
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.05)))
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color.primary.opacity(0.05)))
+    }
+
+    func sourceText(_ r: Reading) -> String {
+        switch r.source {
+        case .check: return "Read by this app's own Claude Code check"
+        case .file(let path): return "Read from \(path.replacingOccurrences(of: home, with: "~"))"
+        }
     }
 }
 
 struct StoredToggle: View {
     @AppStorage private var on: Bool
-    init(_ key: String) { _on = AppStorage(wrappedValue: true, key) }
+    init(_ account: Account) { _on = AppStorage(wrappedValue: isShown(account), showKey(account)) }
     var body: some View { Toggle("", isOn: $on) }
 }
 
@@ -482,7 +729,7 @@ struct SettingsPanel: View {
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             }
             section("Menu bar") {
-                ForEach(accounts) { a in row(a.name) { StoredToggle("show.\(a.id)") } }
+                ForEach(accounts) { a in row(a.name) { StoredToggle(a) } }
                 row("Number") {
                     Picker("", selection: $metric) {
                         Text("Tightest limit").tag("now")
@@ -497,8 +744,7 @@ struct SettingsPanel: View {
                         Text(accounts.map(\.letter).joined(separator: " ")).tag("letters")
                         Text("None").tag("none")
                     }
-                    .pickerStyle(.segmented)
-                    .fixedSize()
+                    .fixedSize()   // a pop-up, not segments: six accounts' marks don't fit as segments
                 }
                 Text("“Tightest limit” is whichever of the weekly and 5-hour limits is closer to running out.")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
@@ -559,20 +805,20 @@ struct PanelView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
                 Text(showSettings ? "Settings" : "Claude usage").font(.system(size: 13, weight: .semibold))
-                if !showSettings, let oldest = model.readings.values.map(\.ageMinutes).max() {
-                    Text("\(ageText(oldest)) · % \(modeWord())").font(.system(size: 10)).foregroundStyle(.secondary)
+                if !showSettings {
+                    Text("% \(modeWord())").font(.system(size: 10.5)).foregroundStyle(.secondary)
                 }
                 Spacer()
                 if !showSettings {
                     if model.refreshing {
                         ProgressView().controlSize(.small).frame(width: 16, height: 16)
                     } else {
-                        Button { model.refreshNow() } label: { Image(systemName: "arrow.clockwise") }
+                        Button { model.loadFiles(); model.check(accounts) } label: { Image(systemName: "arrow.clockwise") }
                             .buttonStyle(.borderless)
-                            .help("Get fresh numbers now")
+                            .help("Check every account now")
                     }
                 }
                 Button { showSettings.toggle() } label: {
@@ -592,18 +838,24 @@ struct PanelView: View {
                         .padding(12)
                         .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.05)))
                 }
-                if let hint = model.hint {
+                ForEach(model.hints, id: \.self) { hint in
                     Label(hint, systemImage: "arrow.right.circle.fill")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(.secondary)
                 }
-                ForEach(accounts) { a in
-                    AccountCard(account: a, model: model, showFiveHour: showFiveHour, showResets: showResets) { onOpen(a) }
+                VStack(spacing: 6) {
+                    ForEach(accounts) { a in
+                        AccountCard(account: a, model: model, showFiveHour: showFiveHour, showResets: showResets) { onOpen(a) }
+                    }
                 }
+                Text("The tick on each bar is how far through that window the clock is. Past it: used faster than an even pace.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(12)
-        .frame(width: 360)
+        .padding(Metrics.pad)
+        .frame(width: Metrics.panelWidth)
     }
 }
 
@@ -635,13 +887,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         model.$readings.receive(on: RunLoop.main).sink { [weak self] _ in self?.readingsChanged() }.store(in: &bag)
         NotificationCenter.default.addObserver(self, selector: #selector(settingsChanged),
                                                name: UserDefaults.didChangeNotification, object: nil)
-        model.refreshNow()
-        // Re-check every minute: redraws countdowns and fetches again once the last try is old enough.
-        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.tick() }
+        model.reloadRoles()
+        model.refreshStale(maxAge: maxAgeClosed)
+        // Every 30 s: pick up newer usage files (free), redraw ages and pace ticks, and check any
+        // account whose newest reading is past the limit for the panel's state.
+        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.tick() }
+        timer?.tolerance = 5
     }
 
     func tick() {
-        if let last = model.lastAttempt, Date().timeIntervalSince(last) / 60 >= autoRefreshMinutes { model.refreshNow() }
+        model.refreshStale(maxAge: popover.isShown ? maxAgeOpen : maxAgeClosed)
         readingsChanged()
     }
 
@@ -658,7 +913,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             popover.performClose(nil)
         } else {
             model.reloadRunning()
-            if let last = model.lastAttempt, Date().timeIntervalSince(last) / 60 > 10 { model.refreshNow() }
+            model.reloadRoles()
+            model.refreshStale(maxAge: maxAgeOpen)
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate()
             // An accessory app often isn't active, so .transient alone misses clicks in other apps.
@@ -674,31 +930,115 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 }
 
-/// Fetches live numbers, then renders the panel and settings (dark appearance) to PNGs.
+/// Fetches live numbers, then renders the panel and settings, dark and light, to PNGs.
 func snapshot(to dir: String) {
     let model = Model()
+    model.reloadRoles()
+    model.loadFiles()
     let done = DispatchSemaphore(value: 0)
-    DispatchQueue.main.async { model.refreshNow { done.signal() } }
+    DispatchQueue.main.async { model.check(accounts) { done.signal() } }
     while done.wait(timeout: .now()) == .timedOut { RunLoop.main.run(until: Date().addingTimeInterval(0.1)) }
-    for (name, settings) in [("panel", false), ("settings", true)] {
-        let view = NSHostingView(rootView: PanelView(model: model, showSettings: settings) { _ in }
-            .background(Color(white: 0.16))
-            .environment(\.colorScheme, .dark))
-        view.appearance = NSAppearance(named: .darkAqua)
-        view.frame = NSRect(origin: .zero, size: view.fittingSize)
-        let window = NSWindow(contentRect: view.frame, styleMask: .borderless, backing: .buffered, defer: false)
-        window.appearance = NSAppearance(named: .darkAqua)
-        window.contentView = view
-        view.layoutSubtreeIfNeeded()
-        guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { continue }
-        view.cacheDisplay(in: view.bounds, to: rep)
-        try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: "\(dir)/\(name).png"))
+    for (look, scheme, appearance, bg) in [("dark", ColorScheme.dark, NSAppearance.Name.darkAqua, Color(white: 0.16)),
+                                           ("light", ColorScheme.light, NSAppearance.Name.aqua, Color(white: 0.94))] {
+        for (name, settings) in [("panel", false), ("settings", true)] {
+            let view = NSHostingView(rootView: PanelView(model: model, showSettings: settings) { _ in }
+                .background(bg)
+                .environment(\.colorScheme, scheme))
+            view.appearance = NSAppearance(named: appearance)
+            view.frame = NSRect(origin: .zero, size: view.fittingSize)
+            let window = NSWindow(contentRect: view.frame, styleMask: .borderless, backing: .buffered, defer: false)
+            window.appearance = NSAppearance(named: appearance)
+            window.contentView = view
+            view.layoutSubtreeIfNeeded()
+            guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { continue }
+            view.cacheDisplay(in: view.bounds, to: rep)
+            try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: "\(dir)/\(name)-\(look).png"))
+        }
     }
     print(menuBarTitle(model).string)
     for a in accounts {
         let r = model.readings[a.id]
-        print("\(a.name): week \(percent(r?.weekUsed)) used, 5-hour \(percent(r?.fiveUsed)) used\(model.problems[a.id].map { " — \($0)" } ?? "")")
+        let from = r.map { $0.source == .check ? "own check" : "usage file" } ?? "no reading"
+        print("\(a.name) [\(model.subtitle(a))]: week \(percent(r?.weekUsed)) used, 5-hour \(percent(r?.fiveUsed)) used, "
+              + "\(r.map { ageText($0.ageMinutes) } ?? "-") from \(from)\(model.problems[a.id].map { " — \($0)" } ?? "")")
     }
+}
+
+/// Checks the pure parts (roles file, usage files, pace maths, reset text) on fixed inputs.
+/// Prints one line per case and exits 1 if any fails.
+func selftest() -> Int32 {
+    var failed = 0
+    func expect(_ name: String, _ ok: Bool) { print(ok ? "ok   \(name)" : "FAIL \(name)"); if !ok { failed += 1 } }
+
+    let yaml = """
+    top: 1
+    accounts:
+      primary: c            # first choice
+      spares: b a      # ordered
+      # a comment line
+      phone: "c"
+      fallback: none
+      nested:
+        deeper: z
+    reserve:
+      primary: a
+    """
+    let parsed = parseRoleSection(yaml, section: "accounts")
+    expect("roles: keys in file order, direct children only", parsed.map(\.key) == ["primary", "spares", "phone", "fallback", "nested"])
+    expect("roles: comment stripped, list split", parsed.first { $0.key == "spares" }?.ids == ["b", "a"])
+    expect("roles: quotes stripped", parsed.first { $0.key == "phone" }?.ids == ["c"])
+    expect("roles: next section not read", !parsed.contains { $0.key == "primary" && $0.ids == ["a"] })
+    expect("roles: missing section gives nothing", parseRoleSection(yaml, section: "nope").isEmpty)
+    let mk = { (id: String, rid: String?) in
+        Account(id: id, name: id, subtitle: "", glyph: "", symbol: "", tint: .gray, letter: "", configDir: nil,
+                tokenFile: nil, desktopProfile: nil, roleID: rid)
+    }
+    let src = RoleSource(file: "", section: "accounts",
+                         labels: ["primary": ["home"], "phone": ["desk"], "spares": ["spare", "last resort"]])
+    let labels = roleLabels(src, text: yaml, for: [mk("0", "a"), mk("1", "b"), mk("2", "c"), mk("3", nil), mk("4", "z")])
+    expect("labels: two roles in file order", labels["2"] == ["home", "desk"])
+    expect("labels: first in list", labels["1"] == ["spare"])
+    expect("labels: second in list", labels["0"] == ["last resort"])
+    expect("labels: no role id, no label", labels["3"] == nil)
+    expect("labels: id not listed, no label", labels["4"] == nil)
+
+    let dir = NSTemporaryDirectory() + "claude-usage-bar-selftest-\(getpid())"
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    func file(_ name: String, _ body: String) -> String {
+        let p = "\(dir)/\(name)"; try? body.write(toFile: p, atomically: true, encoding: .utf8); return p
+    }
+    let good = readUsageFile(file("good.json", #"{"seven_day_pct": 52.0, "seven_day_resets_at": "2030-01-05T15:00:00+00:00", "five_hour_pct": null, "five_hour_resets_at": null, "at_epoch": 1893800000, "source": "x"}"#))
+    expect("usage file: week and age read", good?.weekUsed == 52 && good?.takenAt == Date(timeIntervalSince1970: 1893800000))
+    expect("usage file: ISO reset read", good?.weekResets == ISO8601DateFormatter().date(from: "2030-01-05T15:00:00Z"))
+    expect("usage file: null 5-hour stays absent", good?.fiveUsed == nil && good?.fiveResets == nil)
+    let epoch = readUsageFile(file("epoch.json", #"{"seven_day_pct": 3, "seven_day_resets_at": 1794800000, "five_hour_pct": 7, "five_hour_resets_at": 1794710000.5, "at_epoch": 1794700000}"#))
+    expect("usage file: epoch resets and int percent", epoch?.weekResets == Date(timeIntervalSince1970: 1794800000) && epoch?.fiveUsed == 7)
+    expect("usage file: no at_epoch is ignored", readUsageFile(file("noage.json", #"{"seven_day_pct": 3}"#)) == nil)
+    expect("usage file: no weekly figure is ignored", readUsageFile(file("noweek.json", #"{"at_epoch": 1794700000}"#)) == nil)
+    expect("usage file: junk is ignored", readUsageFile(file("junk.json", "not json")) == nil)
+    expect("usage file: missing file is ignored", readUsageFile("\(dir)/absent.json") == nil)
+    try? FileManager.default.removeItem(atPath: dir)
+
+    let now = Date()
+    let half = Limit(left: 40, resetsAt: now.addingTimeInterval(weekWindow / 2))
+    expect("pace: half way through the week", abs((half.through(at: now) ?? -1) - 0.5) < 0.0001)
+    expect("pace: 60 used at half way is 10 over", abs((half.paceGap(at: now) ?? 0) - 10) < 0.01)
+    expect("pace: over pace is orange", tone(half) == .orange)
+    expect("pace: on pace is uncoloured", tone(Limit(left: 52, resetsAt: now.addingTimeInterval(weekWindow / 2))) == nil)
+    expect("pace: nearly out is red", tone(Limit(left: 8, resetsAt: now.addingTimeInterval(weekWindow * 0.05))) == .red)
+    let five = Limit(left: 90, resetsAt: now.addingTimeInterval(fiveHourWindow * 0.75), window: fiveHourWindow)
+    expect("pace: 5-hour window uses its own length", abs((five.through(at: now) ?? -1) - 0.25) < 0.0001)
+    let passed = Reading(weekUsed: 99, weekResets: now.addingTimeInterval(-10), fiveUsed: nil, fiveResets: nil, takenAt: now)
+    expect("pace: a passed reset is full with no tick", passed.week?.left == 100 && passed.week?.through() == nil)
+    expect("pace text: under", paceText(Limit(left: 90, resetsAt: now.addingTimeInterval(weekWindow / 2))) == "40 under pace")
+    expect("pace text: on", paceText(Limit(left: 49, resetsAt: now.addingTimeInterval(weekWindow / 2))) == "on pace")
+
+    let f = DateFormatter(); f.dateFormat = "EEE HH:mm"
+    let soon = now.addingTimeInterval(3600), later = now.addingTimeInterval(5 * 86400)
+    expect("reset text: one form near and far", resetText(soon) == f.string(from: soon) && resetText(later) == f.string(from: later))
+
+    print(failed == 0 ? "selftest: all passed" : "selftest: \(failed) failed")
+    return failed == 0 ? 0 : 1
 }
 
 @main
@@ -706,6 +1046,7 @@ struct Main {
     static func main() {
         let app = NSApplication.shared
         let args = CommandLine.arguments
+        if args.contains("--selftest") { exit(selftest()) }
         if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
             app.setActivationPolicy(.prohibited)
             snapshot(to: args[i + 1])
